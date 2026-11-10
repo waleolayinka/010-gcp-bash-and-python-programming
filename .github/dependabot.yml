@@ -1,0 +1,19 @@
+# Weekly update PRs for the pinned workflow actions (SHA pins) and the
+# Python dependencies used by python-programming/.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /python-programming
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
