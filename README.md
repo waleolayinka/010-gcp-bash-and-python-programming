@@ -11,7 +11,7 @@ Terraform. This is the GCP port of
 |---|---|
 | Networking | Custom-mode VPC, public + private regional subnets, Cloud Router + Cloud NAT (private subnet only), firewall rules, Private Service Access range + peering, private Cloud DNS zone `db.internal` |
 | Compute | Two e2-micro Debian 12 VMs in two zones, no external IP, OS Login + IAP TCP forwarding (no SSH keys), Shielded VM, dedicated VM service account, private GCS transfer bucket |
-| Database | Cloud SQL for PostgreSQL 17 (Enterprise edition, `db-custom-2-4096`), regional HA, private IP only, SSL required, Query Insights, PITR, 5 retained backups, database `lustrous`, user `db_admin_user`, credentials in Secret Manager, `A` record `<project>-<env>-postgresql.db.internal` |
+| Database | AlloyDB for PostgreSQL 17: cluster `<prefix>-alloydb` with a 2 vCPU regional-HA primary instance `<prefix>-alloydb-primary`, private IP only, SSL required, Query Insights, continuous backup (5-day PITR window), 5 retained daily backups, database `lustrous`, superuser `db_admin_user`, credentials in Secret Manager, `A` record `<project>-<env>-postgresql.db.internal` |
 
 | | Bash | Python |
 |---|---|---|
@@ -33,8 +33,10 @@ Resource names use `<environment>-<project>`, e.g. `bash-programming-vpc`.
 | EC2 + SSM Session Manager | Compute Engine + IAP TCP forwarding + OS Login |
 | IAM role + instance profile + SSM policies | VM service account with `logging.logWriter` and `monitoring.metricWriter` |
 | S3 bucket (SSE, public access block) | GCS bucket (default encryption, uniform access, public access prevention) |
-| Aurora PostgreSQL cluster, 2 instances | Cloud SQL PostgreSQL, `REGIONAL` HA (primary + standby in two zones) |
-| Cluster parameter group | Database flags (`cloudsql.logical_decoding`, `cloudsql.enable_pgaudit`, logging, WAL/worker limits) |
+| Aurora PostgreSQL cluster, 2 instances | AlloyDB cluster with a `REGIONAL` primary instance (active + standby node in two zones, automatic failover) |
+| Aurora master user + `DatabaseName` | AlloyDB built-in user `db_admin_user` with `alloydbsuperuser`; `lustrous` is created with `psql` from vm-1 over IAP SSH, since AlloyDB has no create-database API |
+| Aurora PITR + backup retention period | Continuous backup (PITR) + automated backup policy |
+| Cluster parameter group | Instance database flags (`alloydb.logical_decoding`, `alloydb.enable_pgaudit`, logging, worker limits) |
 | Performance Insights / Enhanced Monitoring | Query Insights / built-in Cloud Monitoring |
 | Secrets Manager secret + SSM SecureString | Two Secret Manager secrets (`-database-credentials` JSON, `-database-password`) |
 | GitHub OIDC provider + IAM role | Workload Identity Federation pool/provider + deploy service account |
@@ -42,11 +44,17 @@ Resource names use `<environment>-<project>`, e.g. `bash-programming-vpc`.
 
 Notes:
 
-- Cloud SQL instance names can't be reused for about a week after deletion,
-  so the instance is named `<prefix>-pg-<random>` and destroy finds it by its
-  `deployment=<prefix>` label.
-- Cloud SQL creation usually takes 10–20 minutes. Cloud SQL with regional HA
-  is the most expensive part of the stack, so run destroy when you're done.
+- AlloyDB has no API for creating databases, so the deploy scripts create
+  `lustrous` by running `psql` on vm-1 over IAP SSH (the Python script calls
+  `gcloud` for this one step). Whoever runs deploy needs
+  `roles/iap.tunnelResourceAccessor` and an OS Login role. If that step
+  fails, the deploy still completes and prints the commands to run by hand.
+- `max_wal_senders` is left at AlloyDB's default: AlloyDB requires at least
+  50, which is already above Aurora's 28.
+- Cluster and instance creation usually take 15–25 minutes together. AlloyDB
+  with regional HA is by far the most expensive part of the stack (two 2 vCPU /
+  16 GB nodes plus storage), so run destroy when you're done. Destroy also
+  deletes the cluster's automated backups, which otherwise outlive it.
 
 ## Prerequisites
 

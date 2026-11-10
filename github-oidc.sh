@@ -75,7 +75,7 @@ echo "Enabling APIs..."
 gcloud services enable \
   iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
   cloudresourcemanager.googleapis.com serviceusage.googleapis.com \
-  compute.googleapis.com dns.googleapis.com sqladmin.googleapis.com \
+  compute.googleapis.com dns.googleapis.com alloydb.googleapis.com \
   servicenetworking.googleapis.com secretmanager.googleapis.com storage.googleapis.com
 
 # 2. Workload Identity Pool + provider that only accepts tokens from $BRANCH.
@@ -132,7 +132,9 @@ DEPLOY_ROLES=(
   roles/iam.serviceAccountAdmin         # create/delete the VM service account
   roles/iam.serviceAccountUser          # attach the VM service account to VMs
   roles/dns.admin                       # private zone + record
-  roles/cloudsql.admin                  # Cloud SQL instance, database, user
+  roles/alloydb.admin                   # AlloyDB cluster, instance, user, backups
+  roles/iap.tunnelResourceAccessor      # IAP SSH to vm-1 to create database lustrous
+  roles/compute.osLogin                 # OS Login on vm-1 (no sudo) for that step
   roles/servicenetworking.networksAdmin # Private Service Access connection
   roles/secretmanager.admin             # database credentials
   roles/storage.admin                   # transfer bucket
