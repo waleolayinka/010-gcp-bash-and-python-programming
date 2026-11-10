@@ -154,18 +154,6 @@ def wait_long_running(
     return operation
 
 
-def wait_sql(gcp: Gcp, operation: dict[str, Any], description: str) -> None:
-    sql = gcp.client("sqladmin", "v1")
-    while operation["status"] != "DONE":
-        time.sleep(15)
-        operation = run(
-            sql.operations().get(project=gcp.project, operation=operation["name"])
-        )
-    errors = operation.get("error", {}).get("errors")
-    if errors:
-        raise RuntimeError(f"{description} failed: {errors}")
-
-
 def delete_compute_if_exists(
     gcp: Gcp, getter: Callable[[], Any], deleter: Callable[[], Any], description: str
 ) -> None:
@@ -206,24 +194,36 @@ def delete_compute(gcp: Gcp, prefix: str) -> None:
 
 def delete_database(gcp: Gcp, prefix: str) -> None:
     banner("Database Resources")
-    sql = gcp.client("sqladmin", "v1")
-    names: list[str] = []
-    request = sql.instances().list(project=gcp.project)
+    alloydb = gcp.client("alloydb", "v1")
+    locations = alloydb.projects().locations()
+    parent = f"projects/{gcp.project}/locations/{gcp.region}"
+    cluster_name = f"{parent}/clusters/{prefix}-alloydb"
+    if get_or_none(locations.clusters().get(name=cluster_name)) is not None:
+        # force=True also deletes the cluster's instances (and continuous backup).
+        LOG.info("Deleting AlloyDB cluster %s-alloydb and its instances.", prefix)
+        wait_long_running(
+            locations.operations(),
+            run(locations.clusters().delete(name=cluster_name, force=True)),
+            "Deleting AlloyDB cluster",
+        )
+
+    # Automated backups outlive their cluster until they expire; remove them.
+    backups: list[str] = []
+    request = locations.backups().list(parent=parent)
     while request is not None:
         response = run(request)
-        names.extend(
-            instance["name"]
-            for instance in response.get("items", [])
-            if instance.get("settings", {}).get("userLabels", {}).get("deployment")
-            == prefix
+        backups.extend(
+            backup["name"]
+            for backup in response.get("backups", [])
+            if backup.get("clusterName", "").endswith(f"/clusters/{prefix}-alloydb")
         )
-        request = sql.instances().list_next(request, response)
-    for name in names:
-        LOG.info("Deleting Cloud SQL instance %s (backups are deleted with it).", name)
-        wait_sql(
-            gcp,
-            run(sql.instances().delete(project=gcp.project, instance=name)),
-            f"Deleting Cloud SQL instance {name}",
+        request = locations.backups().list_next(request, response)
+    for name in backups:
+        LOG.info("Deleting AlloyDB backup %s.", basename(name))
+        wait_long_running(
+            locations.operations(),
+            run(locations.backups().delete(name=name)),
+            f"Deleting AlloyDB backup {basename(name)}",
         )
 
 
@@ -389,7 +389,7 @@ def delete_networking(
                 "Deleting Private Service Access connection",
             )
         except (HttpError, RuntimeError) as exc:
-            # Service Networking can refuse for a while after Cloud SQL
+            # Service Networking can refuse for a while after AlloyDB
             # deletion; removing the peering from our side frees the network.
             LOG.warning("Service Networking refused (%s); deleting the VPC peering directly.", exc)
             wait_compute(
