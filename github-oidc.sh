@@ -38,6 +38,13 @@ PROVIDER_ID="github"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 [[ -n "$GCP_PROJECT" ]] || { echo "ERROR: pass a GCP project ID or run 'gcloud config set project <id>'." >&2; exit 1; }
+# Check credentials before prompts are disabled below; expired tokens otherwise
+# fail mid-script with "cannot prompt during non-interactive execution".
+gcloud auth print-access-token >/dev/null 2>&1 || {
+  echo "ERROR: gcloud credentials are missing or expired for account '$(gcloud config get-value account 2>/dev/null)'." >&2
+  echo "       Run 'gcloud auth login' (needs project owner rights), then rerun this script." >&2
+  exit 1
+}
 export CLOUDSDK_CORE_PROJECT="$GCP_PROJECT"
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
