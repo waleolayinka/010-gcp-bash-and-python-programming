@@ -113,7 +113,7 @@ work_dir="$(mktemp -d)"
 # gcloud on Windows cannot read Git Bash /tmp paths; use the C:/... form.
 if command -v cygpath >/dev/null 2>&1; then work_dir="$(cygpath -m "$work_dir")"; fi
 trap 'rm -rf "$work_dir"' EXIT
-trap 'status=$?; log ERROR "Deployment failed at line ${BASH_LINENO[0]:-unknown} (exit ${status}). Resources already created in GCP were not rolled back."; exit "$status"' ERR
+trap 'status=$?; if ((BASH_SUBSHELL == 0)); then log ERROR "Deployment failed at line ${BASH_LINENO[0]:-unknown} (exit ${status}). Resources already created in GCP were not rolled back."; fi; exit "$status"' ERR
 
 # Shared names (destroy-gcpresources.sh uses the same ones).
 network="${name_prefix}-vpc"
@@ -395,7 +395,7 @@ create_database_resources() {
   # (pg_stat_statements is available as an extension by default).
   # REGIONAL availability = primary + synchronous standby in another zone.
   local operation
-  operation="$(gcloud sql instances create "$instance_name" \
+  operation="$(gcloud beta sql instances create "$instance_name" \
     --database-version=POSTGRES_17 \
     --edition=enterprise \
     --tier=db-custom-2-4096 \
@@ -409,6 +409,7 @@ create_database_resources() {
     --storage-auto-increase \
     --backup-start-time=07:00 \
     --retained-backups-count=5 \
+    --retained-transaction-log-days=5 \
     --enable-point-in-time-recovery \
     --maintenance-window-day=SUN \
     --maintenance-window-hour=9 \
