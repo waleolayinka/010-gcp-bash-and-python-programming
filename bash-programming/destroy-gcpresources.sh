@@ -17,7 +17,8 @@ Defaults match deploy-gcpresources.sh: project=programming, environment=bash,
 region=us-central1. gcp-project-id defaults to $GCP_PROJECT_ID, then
 $CLOUDSDK_CORE_PROJECT, then the active gcloud configuration.
 The script removes resources with the deployment's names, including data in
-its transfer bucket, the Cloud SQL instance, and database credentials.
+its transfer bucket, the AlloyDB cluster and its backups, and database
+credentials.
 USAGE
 }
 
@@ -108,6 +109,7 @@ private_subnet="${name_prefix}-private-${region}"
 psa_range="${name_prefix}-psa-range"
 router="${name_prefix}-router"
 dns_zone="${name_prefix}-db-internal"
+alloydb_cluster="${name_prefix}-alloydb"
 vm_service_account="${name_prefix}-vm@${gcp_project}.iam.gserviceaccount.com"
 bucket_name="${project_name}-${environment_name}-transfer-${gcp_project}"
 peering_name="servicenetworking-googleapis-com"
@@ -140,16 +142,22 @@ delete_compute_instances() {
 
 delete_database_resources() {
   banner "Database Resources"
-  local instances instance_name operation
-  instances="$(gcloud sql instances list \
-    --filter="settings.userLabels.deployment=${name_prefix}" \
-    --format='value(name)')"
-  while IFS= read -r instance_name; do
-    [[ -n "$instance_name" ]] || continue
-    log INFO "Deleting Cloud SQL instance ${instance_name} (backups are deleted with it)."
-    operation="$(gcloud sql instances delete "$instance_name" --async --format='value(name)')"
-    gcloud sql operations wait "$operation" --timeout=unlimited >/dev/null
-  done <<<"$instances"
+  if gcloud alloydb clusters describe "$alloydb_cluster" --region="$region" >/dev/null 2>&1; then
+    # --force also deletes the cluster's instances (and continuous backup).
+    log INFO "Deleting AlloyDB cluster ${alloydb_cluster} and its instances."
+    gcloud alloydb clusters delete "$alloydb_cluster" --region="$region" --force --quiet >/dev/null
+  fi
+
+  # Automated backups outlive their cluster until they expire; remove them.
+  local backups backup
+  backups="$(gcloud alloydb backups list --region="$region" \
+    --filter="clusterName ~ /clusters/${alloydb_cluster}\$" \
+    --format='value(name.basename())')"
+  while IFS= read -r backup; do
+    [[ -n "$backup" ]] || continue
+    log INFO "Deleting AlloyDB backup ${backup}."
+    gcloud alloydb backups delete "$backup" --region="$region" --quiet >/dev/null
+  done <<<"$backups"
 }
 
 delete_database_credentials() {
@@ -224,7 +232,7 @@ delete_network_resources() {
   if gcloud compute networks describe "$network" --format=json |
       jq -e --arg peering "$peering_name" '.peerings[]? | select(.name == $peering)' >/dev/null; then
     log INFO "Removing Private Service Access peering from ${network}."
-    # Service Networking can refuse for a while after Cloud SQL deletion
+    # Service Networking can refuse for a while after AlloyDB deletion
     # ("producer services still using this connection"); removing the
     # peering from our side releases the network either way.
     if ! gcloud services vpc-peerings delete \
