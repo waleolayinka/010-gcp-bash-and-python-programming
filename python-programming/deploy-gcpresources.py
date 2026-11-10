@@ -686,6 +686,8 @@ def create_database(
                         "enabled": True,
                         "startTime": "07:00",
                         "pointInTimeRecoveryEnabled": True,
+                        # Must not exceed retainedBackups (default is 7 days).
+                        "transactionLogRetentionDays": 5,
                         "backupRetentionSettings": {
                             "retentionUnit": "COUNT",
                             "retainedBackups": 5,
