@@ -1,0 +1,9 @@
+# Shell scripts must keep LF endings, even on Windows checkouts;
+# CRLF makes bash fail with "$'\r': command not found".
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Keep the rest consistent in the repo.
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf

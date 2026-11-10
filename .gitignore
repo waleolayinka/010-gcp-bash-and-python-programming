@@ -426,3 +426,27 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# --- Project-specific (ported from 009-aws-python-and-bash-programming) ---
+# Local environment / credentials
+.env
+.env.*
+*.pem
+*.key
+# GCP service account keys / gcloud config (use Workload Identity Federation instead)
+*-key.json
+credentials.json
+application_default_credentials.json
+.config/gcloud/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
