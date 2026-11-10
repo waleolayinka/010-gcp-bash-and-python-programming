@@ -34,10 +34,16 @@ jobs:
     if: github.ref == 'refs/heads/main'
     env:
       GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      # Inputs reach the shell as variables, never as script text.
+      INPUT_PROJECT: ${{ inputs.project }}
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      INPUT_REGION: ${{ inputs.region }}
       ADDITIONAL_DB_NETWORK_TAGS: ${{ secrets.ADDITIONAL_DB_NETWORK_TAGS }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install figlet for banners
         run: |
@@ -45,20 +51,20 @@ jobs:
           sudo apt-get install -y -qq figlet
 
       - name: Authenticate to Google Cloud with Workload Identity Federation
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
       - name: Deploy Bash GCP resources
         shell: bash
         run: |
           bash bash-programming/deploy-gcpresources.sh \
-            "${{ inputs.project }}" \
-            "${{ inputs.environment }}" \
-            "${{ inputs.region }}" \
+            "$INPUT_PROJECT" \
+            "$INPUT_ENVIRONMENT" \
+            "$INPUT_REGION" \
             "$GCP_PROJECT_ID"
