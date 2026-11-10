@@ -15,9 +15,12 @@ Resources created:
               no external IP; reachable only through IAP TCP forwarding with
               OS Login: no SSH keys in metadata. A dedicated VM service
               account and a private GCS transfer bucket.
-  Database:   Cloud SQL for PostgreSQL 17, regional HA (primary + standby in
+  Database:   AlloyDB for PostgreSQL 17 (the Aurora equivalent): a cluster
+              with a regional-HA primary instance (active + standby node in
               two zones), private IP only; port 5432 egress is allowed only
-              from the VM network tag. Credentials in Secret Manager.
+              from the VM network tag. Database lustrous is created with psql
+              from vm-1 over IAP SSH (needs the gcloud CLI). Credentials in
+              Secret Manager.
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import string
+import subprocess
 import sys
 import time
 from typing import Any, Callable
@@ -53,7 +58,7 @@ COMPUTE_URL = "https://www.googleapis.com/compute/v1"
 REQUIRED_APIS = (
     "compute.googleapis.com",
     "dns.googleapis.com",
-    "sqladmin.googleapis.com",
+    "alloydb.googleapis.com",
     "servicenetworking.googleapis.com",
     "secretmanager.googleapis.com",
     "storage.googleapis.com",
@@ -77,18 +82,33 @@ STARTUP_SCRIPT = (
     "apt-get install -y python3 postgresql-client\n"
 )
 # Replace the Aurora cluster parameter group: rds.logical_replication ->
-# cloudsql.logical_decoding, shared_preload_libraries=pgaudit ->
-# cloudsql.enable_pgaudit (pg_stat_statements is available by default).
-DATABASE_FLAGS = (
-    ("log_connections", "on"),
-    ("log_disconnections", "on"),
-    ("log_statement", "all"),
-    ("cloudsql.logical_decoding", "on"),
-    ("max_wal_senders", "28"),
-    ("max_logical_replication_workers", "10"),
-    ("max_worker_processes", "28"),
-    ("cloudsql.enable_pgaudit", "on"),
-)
+# alloydb.logical_decoding, shared_preload_libraries=pgaudit ->
+# alloydb.enable_pgaudit. max_wal_senders stays at AlloyDB's default: AlloyDB
+# requires at least 50, which is already above Aurora's 28.
+DATABASE_FLAGS = {
+    "log_connections": "on",
+    "log_disconnections": "on",
+    "log_statement": "all",
+    "alloydb.logical_decoding": "on",
+    "max_logical_replication_workers": "10",
+    "max_worker_processes": "28",
+    "alloydb.enable_pgaudit": "on",
+}
+ALL_DAYS = ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY")
+# Runs on vm-1 to create the application database (AlloyDB has no API for it).
+# The password and IP are filled in with str.format; the script goes over
+# stdin so the password never appears on a command line.
+CREATE_DATABASE_SCRIPT = """set -e
+export PGPASSWORD='{password}'
+conn='host={private_ip} port=5432 dbname=postgres user=db_admin_user sslmode=require'
+# The startup script installs psql; wait up to 10 minutes for it.
+for _ in $(seq 1 60); do command -v psql >/dev/null 2>&1 && break; sleep 10; done
+if psql "$conn" -tAc "SELECT datname FROM pg_database" | grep -qx lustrous; then
+  echo "Database lustrous already exists."
+else
+  psql "$conn" -c "CREATE DATABASE lustrous"
+fi
+"""
 
 
 class Gcp:
@@ -220,18 +240,6 @@ def wait_long_running(
     if operation.get("error"):
         raise RuntimeError(f"{description} failed: {operation['error']}")
     return operation
-
-
-def wait_sql(gcp: Gcp, operation: dict[str, Any], description: str) -> None:
-    sql = gcp.client("sqladmin", "v1")
-    while operation["status"] != "DONE":
-        time.sleep(15)
-        operation = run(
-            sql.operations().get(project=gcp.project, operation=operation["name"])
-        )
-    errors = operation.get("error", {}).get("errors")
-    if errors:
-        raise RuntimeError(f"{description} failed: {errors}")
 
 
 def generate_password(length: int = 16) -> str:
@@ -507,6 +515,7 @@ def create_compute(
     zones = (zones + zones)[:2]
 
     instance_names: list[str] = []
+    first_vm = (f"{prefix}-vm-1", zones[0])
     for index, zone in enumerate(zones, start=1):
         instance_name = f"{prefix}-vm-{index}"
         body = {
@@ -550,7 +559,7 @@ def create_compute(
         )
         instance_names.append(f"{instance_name} ({zone})")
     LOG.info("VMs launched: %s", ", ".join(instance_names))
-    return {"vm_tag": vm_tag, "service_account": service_account}
+    return {"vm_tag": vm_tag, "service_account": service_account, "first_vm": first_vm}
 
 
 def create_database(
@@ -567,11 +576,12 @@ def create_database(
     project, region = gcp.project, gcp.region
     banner("Database Resources")
     LOG.info(
-        "Creating Private Service Access, private Cloud SQL, credentials, and internal DNS."
+        "Creating Private Service Access, the AlloyDB cluster and primary instance, "
+        "credentials, and internal DNS."
     )
 
-    # Cloud SQL private IP lives in a Google-managed VPC peered to ours
-    # through an allocated range (Private Service Access).
+    # AlloyDB private IPs live in a Google-managed VPC peered to ours through
+    # an allocated range (Private Service Access).
     psa_range = f"{prefix}-psa-range"
     psa_cidr = f"{PSA_ADDRESS}/{PSA_PREFIX_LENGTH}"
     wait_compute(
@@ -657,91 +667,95 @@ def create_database(
             )
         )
 
-    # Cloud SQL names cannot be reused for about a week after deletion, so add
-    # a random suffix; destroy finds the instance by its deployment label.
-    instance_name = f"{prefix}-pg-{secrets.token_hex(3)}"
-    sql = gcp.client("sqladmin", "v1")
-    operation = run(
-        sql.instances().insert(
-            project=project,
-            body={
-                "name": instance_name,
-                "databaseVersion": "POSTGRES_17",
-                "region": region,
-                "settings": {
-                    "edition": "ENTERPRISE",
-                    "tier": "db-custom-2-4096",
-                    # Primary + synchronous standby in another zone.
-                    "availabilityType": "REGIONAL",
-                    "dataDiskType": "PD_SSD",
-                    "dataDiskSizeGb": "10",
-                    "storageAutoResize": True,
-                    "ipConfiguration": {
-                        "ipv4Enabled": False,
-                        "privateNetwork": f"projects/{project}/global/networks/{network['network']}",
+    # AlloyDB is the closest match to Aurora: a cluster with shared regional
+    # storage, plus a primary instance whose REGIONAL availability keeps a
+    # standby node in another zone for automatic failover.
+    alloydb = gcp.client("alloydb", "v1")
+    alloydb_operations = alloydb.projects().locations().operations()
+    cluster_id = f"{prefix}-alloydb"
+    instance_id = f"{cluster_id}-primary"
+    cluster_name = f"projects/{project}/locations/{region}/clusters/{cluster_id}"
+    LOG.info("Creating AlloyDB cluster %s.", cluster_id)
+    wait_long_running(
+        alloydb_operations,
+        run(
+            alloydb.projects().locations().clusters().create(
+                parent=f"projects/{project}/locations/{region}",
+                clusterId=cluster_id,
+                body={
+                    "databaseVersion": "POSTGRES_17",
+                    "networkConfig": {
+                        "network": f"projects/{project_number}/global/networks/{network['network']}",
                         "allocatedIpRange": psa_range,
-                        "sslMode": "ENCRYPTED_ONLY",
                     },
-                    "backupConfiguration": {
+                    # The built-in postgres user gets its own random password,
+                    # which is not stored; db_admin_user is the admin account.
+                    "initialUser": {"user": "postgres", "password": generate_password()},
+                    # Continuous backup replaces Aurora PITR.
+                    "continuousBackupConfig": {"enabled": True, "recoveryWindowDays": 5},
+                    "automatedBackupPolicy": {
                         "enabled": True,
-                        "startTime": "07:00",
-                        "pointInTimeRecoveryEnabled": True,
-                        # Must not exceed retainedBackups (default is 7 days).
-                        "transactionLogRetentionDays": 5,
-                        "backupRetentionSettings": {
-                            "retentionUnit": "COUNT",
-                            "retainedBackups": 5,
+                        "weeklySchedule": {
+                            "daysOfWeek": list(ALL_DAYS),
+                            "startTimes": [{"hours": 7}],
                         },
+                        "quantityBasedRetention": {"count": 5},
+                        "labels": labels,
                     },
-                    # day: 1=Monday ... 7=Sunday
-                    "maintenanceWindow": {"day": 7, "hour": 9},
-                    "insightsConfig": {"queryInsightsEnabled": True},
-                    "databaseFlags": [
-                        {"name": name, "value": value} for name, value in DATABASE_FLAGS
-                    ],
-                    "userLabels": labels,
-                    "deletionProtectionEnabled": False,
+                    "maintenanceUpdatePolicy": {
+                        "maintenanceWindows": [{"day": "SUNDAY", "startTime": {"hours": 9}}]
+                    },
+                    "labels": labels,
                 },
+            )
+        ),
+        f"Creating AlloyDB cluster {cluster_id}",
+    )
+
+    LOG.info(
+        "Creating AlloyDB primary instance %s (this usually takes 10-15 minutes).",
+        instance_id,
+    )
+    wait_long_running(
+        alloydb_operations,
+        run(
+            alloydb.projects().locations().clusters().instances().create(
+                parent=cluster_name,
+                instanceId=instance_id,
+                body={
+                    "instanceType": "PRIMARY",
+                    "availabilityType": "REGIONAL",
+                    "machineConfig": {"cpuCount": 2},
+                    "databaseFlags": DATABASE_FLAGS,
+                    "clientConnectionConfig": {"sslConfig": {"sslMode": "ENCRYPTED_ONLY"}},
+                    "labels": labels,
+                },
+            )
+        ),
+        f"Creating AlloyDB instance {instance_id}",
+    )
+
+    # Aurora's master user becomes an AlloyDB superuser.
+    run(
+        alloydb.projects().locations().clusters().users().create(
+            parent=cluster_name,
+            userId="db_admin_user",
+            body={
+                "password": password,
+                "userType": "ALLOYDB_BUILT_IN",
+                "databaseRoles": ["alloydbsuperuser"],
             },
         )
     )
-    LOG.info(
-        "Waiting for Cloud SQL instance %s (this usually takes 10-20 minutes).",
-        instance_name,
-    )
-    wait_sql(gcp, operation, f"Creating Cloud SQL instance {instance_name}")
-    wait_sql(
-        gcp,
-        run(
-            sql.databases().insert(
-                project=project, instance=instance_name, body={"name": "lustrous"}
-            )
-        ),
-        "Creating database lustrous",
-    )
-    wait_sql(
-        gcp,
-        run(
-            sql.users().insert(
-                project=project,
-                instance=instance_name,
-                body={"name": "db_admin_user", "password": password},
-            )
-        ),
-        "Creating database user",
-    )
 
-    instance = run(sql.instances().get(project=project, instance=instance_name))
-    private_ip = next(
-        (
-            address["ipAddress"]
-            for address in instance.get("ipAddresses", [])
-            if address.get("type") == "PRIVATE"
-        ),
-        None,
+    instance = run(
+        alloydb.projects().locations().clusters().instances().get(
+            name=f"{cluster_name}/instances/{instance_id}"
+        )
     )
+    private_ip = instance.get("ipAddress")
     if not private_ip:
-        raise RuntimeError(f"Cloud SQL instance {instance_name} has no private IP.")
+        raise RuntimeError(f"AlloyDB instance {instance_id} has no private IP.")
 
     dns_name = f"{project_name}-{environment}-postgresql.db.internal."
     run(
@@ -751,13 +765,73 @@ def create_database(
             body={"name": dns_name, "type": "A", "ttl": 30, "rrdatas": [private_ip]},
         )
     )
+
+    create_application_database(
+        gcp, compute_result["first_vm"], private_ip, password, password_secret
+    )
     return {
-        "instance_name": instance_name,
+        "cluster_id": cluster_id,
+        "instance_id": instance_id,
         "private_ip": private_ip,
         "dns_name": dns_name.rstrip("."),
         "credentials_secret": credentials_secret,
         "password_secret": password_secret,
     }
+
+
+def create_application_database(
+    gcp: Gcp, vm: tuple[str, str], private_ip: str, password: str, password_secret: str
+) -> None:
+    """Run CREATE DATABASE lustrous with psql on vm-1 over IAP SSH.
+
+    AlloyDB has no API for creating databases (Aurora's DatabaseName), and the
+    instance is reachable only from the VPC. A failure here only warns,
+    because everything else is already deployed.
+    """
+    vm_name, zone = vm
+    manual_steps = (
+        f"gcloud compute ssh {vm_name} --zone {zone} --tunnel-through-iap "
+        f"--project {gcp.project}\n  then: PGPASSWORD=<secret {password_secret}> "
+        f"psql 'host={private_ip} dbname=postgres user=db_admin_user sslmode=require' "
+        "-c 'CREATE DATABASE lustrous'"
+    )
+    gcloud = shutil.which("gcloud")
+    if gcloud is None:
+        LOG.warning("gcloud not found; create database lustrous yourself:\n  %s", manual_steps)
+        return
+
+    LOG.info("Creating database lustrous from %s over IAP SSH.", vm_name)
+    command = [
+        gcloud,
+        "compute",
+        "ssh",
+        vm_name,
+        f"--zone={zone}",
+        f"--project={gcp.project}",
+        "--tunnel-through-iap",
+        "--strict-host-key-checking=no",
+        "--quiet",
+        "--command=bash -s",
+    ]
+    script = CREATE_DATABASE_SCRIPT.format(password=password, private_ip=private_ip)
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(command, input=script, text=True, check=False)
+        if result.returncode == 0:
+            return
+        if attempt < attempts:
+            LOG.warning(
+                "IAP SSH to %s failed (attempt %d/%d); retrying in 30s.",
+                vm_name,
+                attempt,
+                attempts,
+            )
+            time.sleep(30)
+    LOG.warning(
+        "Could not create database lustrous automatically. Create it from %s:\n  %s",
+        vm_name,
+        manual_steps,
+    )
 
 
 def resolve_project(explicit: str | None, default_project: str | None) -> str:
@@ -834,8 +908,8 @@ def main() -> int:
             extra_tags,
         )
         print(
-            f"Cloud SQL instance: {database['instance_name']} "
-            f"(private IP {database['private_ip']})"
+            f"AlloyDB cluster: {database['cluster_id']}, primary instance "
+            f"{database['instance_id']} (private IP {database['private_ip']})"
         )
         print(f"Private database DNS: {database['dns_name']}")
         print(f"Credentials: Secret Manager secret {database['credentials_secret']}")
