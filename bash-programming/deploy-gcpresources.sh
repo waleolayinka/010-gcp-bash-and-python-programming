@@ -15,9 +15,11 @@
 #               no external IP; reachable only through IAP TCP forwarding with
 #               OS Login: no SSH keys in metadata. A dedicated VM service
 #               account and a private GCS transfer bucket.
-#   Database:   Cloud SQL for PostgreSQL 17, regional HA (primary + standby in
+#   Database:   AlloyDB for PostgreSQL 17 (the Aurora equivalent): a cluster
+#               with a regional-HA primary instance (active + standby node in
 #               two zones), private IP only; port 5432 egress is allowed only
-#               from the VM network tag. Credentials in Secret Manager.
+#               from the VM network tag. Database lustrous is created with
+#               psql from vm-1 over IAP SSH. Credentials in Secret Manager.
 
 set -Eeuo pipefail
 
@@ -130,11 +132,13 @@ nat="${name_prefix}-nat"
 dns_zone="${name_prefix}-db-internal"
 vm_tag="${name_prefix}-vm"
 vm_service_account_id="${name_prefix}-vm"
+alloydb_cluster="${name_prefix}-alloydb"
+alloydb_instance="${alloydb_cluster}-primary"
 labels="deployment=${name_prefix},env=${environment_name},project_name=${project_name}"
 required_apis=(
   compute.googleapis.com
   dns.googleapis.com
-  sqladmin.googleapis.com
+  alloydb.googleapis.com
   servicenetworking.googleapis.com
   secretmanager.googleapis.com
   storage.googleapis.com
@@ -317,11 +321,48 @@ BOOTSTRAP
   log INFO "VMs launched: ${instance_names[*]}"
 }
 
+run_on_vm() {
+  # run_on_vm <vm> <zone> <script>: the script goes over stdin, so secrets in
+  # it never appear on a command line.
+  printf '%s\n' "$3" | gcloud compute ssh "$1" \
+    --zone="$2" \
+    --tunnel-through-iap \
+    --strict-host-key-checking=no \
+    --command='bash -s' >&2
+}
+
+# AlloyDB has no API for creating databases (Aurora's DatabaseName), so run
+# CREATE DATABASE with psql from vm-1 over IAP SSH. A failure here only warns,
+# because everything else is already deployed.
+create_application_database() {
+  local private_ip="$1" password="$2"
+  local vm="${name_prefix}-vm-1" zone remote_script
+  zone="$(gcloud compute instances list --filter="name=${vm}" --format='value(zone.basename())')"
+  remote_script="$(printf '%s\n' \
+    'set -e' \
+    "export PGPASSWORD='${password}'" \
+    "conn='host=${private_ip} port=5432 dbname=postgres user=db_admin_user sslmode=require'" \
+    '# The startup script installs psql; wait up to 10 minutes for it.' \
+    'for _ in $(seq 1 60); do command -v psql >/dev/null 2>&1 && break; sleep 10; done' \
+    'if psql "$conn" -tAc "SELECT datname FROM pg_database" | grep -qx lustrous; then' \
+    '  echo "Database lustrous already exists."' \
+    'else' \
+    '  psql "$conn" -c "CREATE DATABASE lustrous"' \
+    'fi')"
+
+  log INFO "Creating database lustrous from ${vm} over IAP SSH."
+  if ! retry 5 30 run_on_vm "$vm" "$zone" "$remote_script"; then
+    log WARN "Could not create database lustrous automatically. Create it from ${vm}:"
+    log WARN "  gcloud compute ssh ${vm} --zone ${zone} --tunnel-through-iap --project ${gcp_project}"
+    log WARN "  PGPASSWORD=<secret ${name_prefix}-database-password> psql 'host=${private_ip} dbname=postgres user=db_admin_user sslmode=require' -c 'CREATE DATABASE lustrous'"
+  fi
+}
+
 create_database_resources() {
   banner "Database Resources"
-  log INFO "Creating Private Service Access, the private Cloud SQL instance, credentials, and internal DNS record."
+  log INFO "Creating Private Service Access, the AlloyDB cluster and primary instance, credentials, and internal DNS record."
 
-  # Cloud SQL private IP lives in a Google-managed VPC peered to ours through
+  # AlloyDB private IPs live in a Google-managed VPC peered to ours through
   # an allocated range (Private Service Access).
   gcloud compute addresses create "$psa_range" \
     --global \
@@ -383,54 +424,59 @@ create_database_resources() {
       --labels="$labels" \
       --data-file=- >/dev/null
 
-  # Cloud SQL names cannot be reused for about a week after deletion, so add a
-  # random suffix; destroy finds the instance by its deployment label.
-  local suffix
-  suffix="$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  local instance_name="${name_prefix}-pg-${suffix}"
+  # AlloyDB is the closest match to Aurora: a cluster with shared regional
+  # storage, plus a primary instance whose REGIONAL availability keeps a
+  # standby node in another zone for automatic failover.
+  # The cluster's built-in postgres user gets its own random password, which
+  # is not stored; db_admin_user (below) is the admin account to use.
+  local postgres_password
+  postgres_password="$(generate_password)"
+
+  # Continuous backup replaces Aurora PITR; automated backups keep the last 5.
+  log INFO "Creating AlloyDB cluster ${alloydb_cluster}."
+  gcloud alloydb clusters create "$alloydb_cluster" \
+    --region="$region" \
+    --database-version=POSTGRES_17 \
+    --network="$network" \
+    --allocated-ip-range-name="$psa_range" \
+    --password="$postgres_password" \
+    --enable-continuous-backup \
+    --continuous-backup-recovery-window-days=5 \
+    --automated-backup-days-of-week=MONDAY,TUESDAY,WEDNESDAY,THURSDAY,FRIDAY,SATURDAY,SUNDAY \
+    --automated-backup-start-times=07:00 \
+    --automated-backup-retention-count=5 \
+    --maintenance-window-day=SUNDAY \
+    --maintenance-window-hour=9 >/dev/null
 
   # Database flags replace the Aurora cluster parameter group:
-  # rds.logical_replication -> cloudsql.logical_decoding,
-  # shared_preload_libraries=pgaudit -> cloudsql.enable_pgaudit
-  # (pg_stat_statements is available as an extension by default).
-  # REGIONAL availability = primary + synchronous standby in another zone.
-  local operation
-  operation="$(gcloud beta sql instances create "$instance_name" \
-    --database-version=POSTGRES_17 \
-    --edition=enterprise \
-    --tier=db-custom-2-4096 \
+  # rds.logical_replication -> alloydb.logical_decoding,
+  # shared_preload_libraries=pgaudit -> alloydb.enable_pgaudit.
+  # max_wal_senders stays at AlloyDB's default: AlloyDB requires at least 50,
+  # which is already above Aurora's 28. Query Insights is on by default.
+  log INFO "Creating AlloyDB primary instance ${alloydb_instance} (this usually takes 10-15 minutes)."
+  gcloud alloydb instances create "$alloydb_instance" \
+    --cluster="$alloydb_cluster" \
     --region="$region" \
+    --instance-type=PRIMARY \
+    --cpu-count=2 \
     --availability-type=REGIONAL \
-    --network="projects/${gcp_project}/global/networks/${network}" \
-    --no-assign-ip \
     --ssl-mode=ENCRYPTED_ONLY \
-    --storage-type=SSD \
-    --storage-size=10GB \
-    --storage-auto-increase \
-    --backup-start-time=07:00 \
-    --retained-backups-count=5 \
-    --retained-transaction-log-days=5 \
-    --enable-point-in-time-recovery \
-    --maintenance-window-day=SUN \
-    --maintenance-window-hour=9 \
-    --insights-config-query-insights-enabled \
-    --database-flags=log_connections=on,log_disconnections=on,log_statement=all,cloudsql.logical_decoding=on,max_wal_senders=28,max_logical_replication_workers=10,max_worker_processes=28,cloudsql.enable_pgaudit=on \
-    --labels="$labels" \
-    --no-deletion-protection \
-    --async \
-    --format='value(name)')"
-  log INFO "Waiting for Cloud SQL instance ${instance_name} (this usually takes 10-20 minutes)."
-  gcloud sql operations wait "$operation" --timeout=unlimited >/dev/null
+    --database-flags=log_connections=on,log_disconnections=on,log_statement=all,alloydb.logical_decoding=on,max_logical_replication_workers=10,max_worker_processes=28,alloydb.enable_pgaudit=on \
+    --labels="$labels" >/dev/null
 
-  gcloud sql databases create lustrous --instance="$instance_name" >/dev/null
-  gcloud sql users create db_admin_user \
-    --instance="$instance_name" \
-    --password="$db_password" >/dev/null
+  # Aurora's master user becomes an AlloyDB superuser (alloydbsuperuser role).
+  gcloud alloydb users create db_admin_user \
+    --cluster="$alloydb_cluster" \
+    --region="$region" \
+    --password="$db_password" \
+    --superuser=true >/dev/null
 
   local private_ip
-  private_ip="$(gcloud sql instances describe "$instance_name" --format=json |
-    jq -r '[.ipAddresses[]? | select(.type=="PRIVATE") | .ipAddress][0] // empty')"
-  [[ -n "$private_ip" ]] || die "Cloud SQL instance ${instance_name} has no private IP."
+  private_ip="$(gcloud alloydb instances describe "$alloydb_instance" \
+    --cluster="$alloydb_cluster" \
+    --region="$region" \
+    --format='value(ipAddress)')"
+  [[ -n "$private_ip" ]] || die "AlloyDB instance ${alloydb_instance} has no private IP."
 
   local dns_record="${project_name}-${environment_name}-postgresql.db.internal."
   gcloud dns record-sets create "$dns_record" \
@@ -439,7 +485,10 @@ create_database_resources() {
     --ttl=30 \
     --rrdatas="$private_ip" >/dev/null
 
-  printf 'Cloud SQL instance: %s (private IP %s)\n' "$instance_name" "$private_ip"
+  create_application_database "$private_ip" "$db_password"
+
+  printf 'AlloyDB cluster: %s, primary instance %s (private IP %s)\n' \
+    "$alloydb_cluster" "$alloydb_instance" "$private_ip"
   printf 'Private database DNS: %s\n' "${dns_record%.}"
   printf 'Credentials: Secret Manager secret %s\n' "$credentials_secret"
   printf 'Password secret: %s\n' "$password_secret"
